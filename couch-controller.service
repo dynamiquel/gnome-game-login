@@ -1,0 +1,15 @@
+[Unit]
+Description=Controller unlock + Steam Big Picture (couch mode)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/couch-controller.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

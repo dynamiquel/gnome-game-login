@@ -1,0 +1,16 @@
+{
+  "combo": ["UP", "DOWN", "LEFT", "RIGHT"],
+  "press_gap_ms": 2500,
+  "window_ms": 10000,
+  "allowed_controller_ids": [],
+  "launch_on_connect_when_unlocked": true,
+  "launch_delay_ms": 2000,
+  "min_action_interval_ms": 3000,
+  "vendor_id": "045e",
+  "steam_binary": "/usr/bin/steam",
+  "force_restart_hold_ms": 5000,
+  "hang_watchdog": true,
+  "hang_cpu_percent": 85,
+  "hang_seconds": 240,
+  "hang_sample_seconds": 15
+}
