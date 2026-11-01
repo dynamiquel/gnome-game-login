@@ -1,5 +1,10 @@
 {
-  "combo": ["UP", "DOWN", "LEFT", "RIGHT"],
+  "combo": [
+    "UP",
+    "DOWN",
+    "LEFT",
+    "RIGHT"
+  ],
   "press_gap_ms": 2500,
   "window_ms": 10000,
   "allowed_controller_ids": [],
@@ -12,5 +17,6 @@
   "hang_watchdog": true,
   "hang_cpu_percent": 85,
   "hang_seconds": 240,
-  "hang_sample_seconds": 15
+  "hang_sample_seconds": 15,
+  "grab_when_locked": true
 }

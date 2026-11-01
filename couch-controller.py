@@ -41,7 +41,7 @@ import evdev
 from evdev import ecodes
 
 LOG = logging.getLogger("couch-controller")
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CONFIG_DIR = os.path.expanduser("~/.config/couch-controller")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -86,6 +86,7 @@ DEFAULT_CONFIG = {
     "window_ms": 10000,
     "allowed_controller_ids": [],
     "launch_on_connect_when_unlocked": True,
+    "grab_when_locked": True,
     "launch_delay_ms": 2000,
     "min_action_interval_ms": 3000,
     "vendor_id": "045e",
@@ -304,15 +305,23 @@ class Actions:
         self.pending_launch: float | None = None
 
     # --- session state -------------------------------------------------
-    def session_locked(self) -> bool:
+    def lock_state(self) -> bool | None:
+        """True/False, or None when the lock state cannot be read.
+
+        None matters for the grab logic: a gdbus timeout must not make the
+        daemon believe the session is unlocked and release the controller.
+        """
         out = _gdbus(
             "org.gnome.ScreenSaver",
             "/org/gnome/ScreenSaver",
             "org.gnome.ScreenSaver.GetActive",
         )
         if not out:
-            return False
+            return None
         return out.lower().startswith("(true")
+
+    def session_locked(self) -> bool:
+        return self.lock_state() is True
 
     def unlock(self) -> bool:
         LOG.info("unlocking session")
@@ -712,6 +721,8 @@ class Controller:
     held: set[int] = field(default_factory=set)
     hold_start: float | None = None
     hold_fired: bool = False
+    grabbed: bool = False
+    grab_warned: bool = False
 
 
 def _is_controller(dev: evdev.InputDevice, vendor: int) -> bool:
@@ -807,6 +818,9 @@ class Daemon:
         self.running = True
         self._initial_scan = True
         self.watchdog: SteamWatchdog | None = None
+        self.grab_when_locked = bool(cfg.get("grab_when_locked", True))
+        self._locked_now: bool | None = None
+        self._last_lock_poll = 0.0
 
     def stop(self, *_args) -> None:
         self.running = False
@@ -832,11 +846,14 @@ class Daemon:
             if key in self.controllers:
                 dev.close()  # already tracked
                 continue
-            self.controllers[key] = Controller(dev, key, ComboMatcher(combo, window, gap))
+            ctrl = Controller(dev, key, ComboMatcher(combo, window, gap))
+            self.controllers[key] = ctrl
             LOG.info(
                 "controller connected: %s (%s) id=%r",
                 dev.name, dev.path, dev.uniq or "",
             )
+            if self._locked_now is True:
+                self._apply_grab(ctrl, True)
             if not self._initial_scan:
                 self.actions.on_connect()
 
@@ -876,6 +893,7 @@ class Daemon:
         if ctrl.matcher.feed(name):
             LOG.debug("sequence matched on %s", ctrl.dev.name)
             self.actions.on_combo()
+            self.update_grab_state(force=True)
 
     def check_holds(self) -> None:
         hold_s = float(self.cfg.get("force_restart_hold_ms", 5000)) / 1000.0
@@ -892,6 +910,57 @@ class Daemon:
                 ctrl.held.clear()
                 ctrl.hold_start = None
 
+    def _apply_grab(self, ctrl: Controller, want: bool) -> None:
+        if want and not ctrl.grabbed:
+            try:
+                ctrl.dev.grab()
+                ctrl.grabbed = True
+                ctrl.grab_warned = False
+                LOG.info("controller grabbed while locked: %s", ctrl.dev.name)
+            except OSError as exc:
+                if not ctrl.grab_warned:
+                    LOG.warning(
+                        "could not grab %s while locked (%s); Steam may still see it",
+                        ctrl.dev.name, exc,
+                    )
+                    ctrl.grab_warned = True
+        elif not want and ctrl.grabbed:
+            try:
+                ctrl.dev.ungrab()
+            except OSError as exc:
+                LOG.debug("could not release %s: %s", ctrl.dev.name, exc)
+            ctrl.grabbed = False
+            LOG.info("controller released: %s", ctrl.dev.name)
+
+    def _apply_grab_all(self, want: bool) -> None:
+        for ctrl in list(self.controllers.values()):
+            self._apply_grab(ctrl, want)
+
+    def update_grab_state(self, force: bool = False) -> None:
+        """Grab controllers while the session is locked.
+
+        The GNOME lock screen locks the session UI, not gamepads: Steam Input
+        keeps reading /dev/input in the background and can still act on Guide
+        chords (including its power menu).  EVIOCGRAB while locked makes the
+        daemon the only consumer; it still receives the unlock combo.  The
+        grab is released as soon as the session is unlocked.
+        """
+        if not self.grab_when_locked:
+            self._apply_grab_all(False)
+            return
+
+        now = time.monotonic()
+        if not force and now - self._last_lock_poll < 2.0:
+            return
+        self._last_lock_poll = now
+
+        state = self.actions.lock_state()
+        if state is None:
+            LOG.debug("lock state unavailable; keeping current grab state")
+            return
+        self._locked_now = state
+        self._apply_grab_all(state)
+
     def run(self) -> int:
         LOG.info("watching for Xbox controllers (vendor %04x)", self.vendor)
         LOG.info("combo: %s", " ".join(self.cfg["combo"]))
@@ -906,6 +975,7 @@ class Daemon:
         while self.running:
             self.actions.tick()
             self.check_holds()
+            self.update_grab_state()
             try:
                 self.rescan()
             except OSError as exc:
@@ -920,6 +990,8 @@ class Daemon:
                 timeout = 0.25
             elif self.actions.pending_launch is not None:
                 timeout = 0.5
+            elif self.grab_when_locked:
+                timeout = 1.0
             else:
                 timeout = RESCAN_INTERVAL
             try:
@@ -1157,6 +1229,41 @@ def self_test() -> int:
     for code in (ecodes.BTN_SELECT, ecodes.BTN_START):
         daemon.handle_event(ctrl, SimpleNamespace(type=ecodes.EV_KEY, code=code, value=0))
     check("release resets the hold", ctrl.hold_fired, False)
+
+    # Grab-while-locked.
+    class FakeDev:
+        name = "fake"
+
+        def __init__(self):
+            self.grabbed = False
+
+        def grab(self):
+            self.grabbed = True
+
+        def ungrab(self):
+            self.grabbed = False
+
+    def grab_daemon(enabled: bool, locked: bool):
+        cfg = dict(DEFAULT_CONFIG)
+        cfg["grab_when_locked"] = enabled
+        daemon = Daemon(cfg, dry_run=True)
+        daemon.actions.lock_state = lambda: locked
+        dev = FakeDev()
+        ctrl = Controller(
+            dev=dev, key=("fake",), matcher=ComboMatcher(steps, 10.0, 2.5)
+        )
+        daemon.controllers[("fake",)] = ctrl
+        return daemon, ctrl
+
+    daemon, ctrl = grab_daemon(True, True)
+    daemon.update_grab_state(force=True)
+    check("locked session grabs the controller", ctrl.grabbed, True)
+    daemon.actions.lock_state = lambda: False
+    daemon.update_grab_state(force=True)
+    check("unlock releases the controller", ctrl.grabbed, False)
+    daemon, ctrl = grab_daemon(False, True)
+    daemon.update_grab_state(force=True)
+    check("grab can be disabled by config", ctrl.grabbed, False)
 
     print("self-test:", "FAILED" if failures else "passed")
     return 1 if failures else 0

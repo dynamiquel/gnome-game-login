@@ -31,6 +31,8 @@ It does **not** authenticate you to the system. It does not touch GDM, PAM,
 - A different, non-allowlisted controller triggering the combo.
 - Accidental activation while a game is running (the combo is ignored when the
   session is unlocked, and focus is never taken from a game).
+- Steam Input reacting to Guide-button chords while the screen is locked
+  (the daemon grabs the controller with `EVIOCGRAB` while locked by default).
 - A wedged Steam stealing CPU/RAM indefinitely (optional watchdog, conservative
   and disabled while a game/download/shader job runs).
 

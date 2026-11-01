@@ -81,7 +81,8 @@ Edit `~/.config/couch-controller/config.json`:
 {
   "combo": ["UP", "DOWN", "LEFT", "RIGHT"],
   "press_gap_ms": 2500,
-  "window_ms": 10000
+  "window_ms": 10000,
+  "grab_when_locked": true
 }
 ```
 
@@ -113,6 +114,22 @@ and copy the `id=` value into the list:
 
 An empty list accepts any Xbox controller. This is a convenience filter, not a
 security boundary (see below).
+
+## Locked-screen input
+
+GNOME's lock screen locks the session UI, not gamepads. Steam Input keeps
+reading `/dev/input` in the background and can still act on Guide-button
+chords, including its power menu (which can suspend the machine) while the
+screen is locked.
+
+With `grab_when_locked` enabled (the default), the daemon takes exclusive
+control of the controller with `EVIOCGRAB` while the session is locked. Steam
+cannot see the device, but the daemon still receives the unlock combo, and it
+releases the controller immediately when the session unlocks.
+
+If Steam has already grabbed the device, the daemon logs a warning and retries;
+disabling Steam's Guide Button Chord Layout / "Guide button focuses Steam" is
+the fallback.
 
 ## Force restart
 
