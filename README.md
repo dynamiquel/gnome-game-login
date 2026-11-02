@@ -45,6 +45,8 @@ without taking focus from the game, which is why it is not attempted.
 - `wmctrl`
 - Steam installed at `/usr/bin/steam` (configurable)
 - A controller that appears as an Xbox pad (`vendor 045e`)
+- On Wayland: `extest` (recommended) so Steam's virtual keyboard and desktop
+  controller layout do not trigger GNOME's Remote Desktop prompt
 
 Fedora / Nobara:
 
@@ -152,6 +154,39 @@ Every 15 s the service samples the combined CPU of `steam` and
 Tune with `hang_cpu_percent`, `hang_seconds`, `hang_sample_seconds`, or set
 `"hang_watchdog": false`.
 
+## Steam input on Wayland
+
+GNOME 50 starts Xwayland with EI portal support. Steam's on-screen keyboard and
+controller desktop layout inject input with **XTEST**, so Xwayland asks the
+RemoteDesktop portal for an EIS socket. The resulting GNOME permission dialog
+has to be accepted again for every new XTEST client, because Xwayland does not
+request a persistent permission.
+
+`couch-controller` avoids that path by preloading `extest` into Steam launches
+when it is installed. extest replaces XTEST with a `uinput` virtual device, so
+Steam input works without the portal. No wrapper script or desktop-file edit is
+needed; the daemon sets `LD_PRELOAD` only for Steam and its children.
+
+Defaults:
+
+```json
+{
+  "preload_extest": true,
+  "extest_library": "/usr/${LIB}/extest/libextest.so"
+}
+```
+
+`${LIB}` is expanded by the dynamic loader to `lib64` or `lib`, covering both
+32- and 64-bit Steam processes. Steam's pressure-vessel runtime understands the
+same token and maps the library into its containers.
+
+- Set `"preload_extest": false` to disable it.
+- Set `"extest_library"` to a custom path if your distribution installs the
+  libraries elsewhere.
+- `--doctor` reports whether extest was found and warns on Wayland when it is
+  missing.
+- extest is not required on X11; XTEST and XWayland work normally there.
+
 ## Tests
 
 No controller, Steam or session changes are required:
@@ -196,6 +231,9 @@ so regressions such as swapped X/Y buttons fail the tests.
    `loginctl unlock-session`, then resets the Mutter idle timer.
 5. Focus uses `wmctrl -i -a` on the XWayland Big Picture window; Mutter honours
    EWMH activation.
+6. Steam launches inherit an `LD_PRELOAD` pointing at `extest` when it is
+   installed, so Steam's XTEST-based keyboard and desktop controller input do
+   not go through the Wayland RemoteDesktop portal.
 
 ## Security model
 
@@ -248,6 +286,10 @@ journalctl --user -u couch-controller.service -f
   `wmctrl -lx` lists `Steam Big Picture Mode`.
 - **X and Y swapped?** They are not: on Linux `BTN_NORTH` is X. The self-test
   encodes the real mapping.
+- **GNOME asks to enable Remote Desktop when using the Steam keyboard:** run
+  `--doctor` and check the `extest Steam input` line. Install `extest` if it is
+  missing, or set `"preload_extest": false` only if you do not need Steam's
+  virtual keyboard / desktop controller input.
 
 ## Uninstall
 

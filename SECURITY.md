@@ -24,6 +24,9 @@ It does **not** authenticate you to the system. It does not touch GDM, PAM,
 - A controller allowlist (`allowed_controller_ids`) is a convenience filter.
   An unprivileged local process can create a virtual gamepad with any
   vendor/serial, and an attacker with disk access can edit the config.
+- The daemon sets `LD_PRELOAD` to the system `extest` library for Steam child
+  processes only. It does not preload code into itself, the desktop session, or
+  unrelated applications. Disable it with `"preload_extest": false`.
 
 ## What it protects against
 

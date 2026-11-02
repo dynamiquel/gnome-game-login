@@ -24,6 +24,7 @@ joystick event nodes are ACL'd to the seated user by systemd's uaccess rule.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -41,7 +43,7 @@ import evdev
 from evdev import ecodes
 
 LOG = logging.getLogger("couch-controller")
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 CONFIG_DIR = os.path.expanduser("~/.config/couch-controller")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -54,6 +56,14 @@ STEAM_DIRS = (
     os.path.expanduser("~/.local/share/Steam"),
     os.path.expanduser("~/.steam/steam"),
 )
+
+# Steam's virtual keyboard and desktop controller layout use XTEST.  On
+# Wayland, Xwayland forwards that through the RemoteDesktop portal, which asks
+# GNOME for permission on every new client.  extest replaces XTEST with a
+# uinput device, so preload it for Steam when it is installed.  ${LIB} is
+# expanded to lib64/lib by the loader (and by Steam's pressure-vessel runtime),
+# so the same setting covers both 32- and 64-bit Steam processes.
+EXTEST_LIBRARY = "/usr/${LIB}/extest/libextest.so"
 
 # Button name -> possible evdev events.  A hat direction can arrive either as
 # ABS_HAT0* (xpad/xone) or as BTN_DPAD_* (some HID drivers), so both are
@@ -91,6 +101,8 @@ DEFAULT_CONFIG = {
     "min_action_interval_ms": 3000,
     "vendor_id": "045e",
     "steam_binary": "/usr/bin/steam",
+    "preload_extest": True,
+    "extest_library": EXTEST_LIBRARY,
     "force_restart_hold_ms": 5000,
     "hang_watchdog": True,
     "hang_cpu_percent": 85,
@@ -230,7 +242,52 @@ def _gdbus(dest: str, path: str, method: str, *args: str) -> str:
         return ""
 
 
-def _spawn(cmd: list[str]) -> None:
+def _expand_lib_path(path: str) -> list[str]:
+    """Expand ld.so's ${LIB} token for both 64- and 32-bit libraries."""
+    if "${LIB}" not in path and "$LIB" not in path:
+        return [path]
+    return [
+        path.replace("${LIB}", lib).replace("$LIB", lib)
+        for lib in ("lib64", "lib")
+    ]
+
+
+def _extest_available(path: str) -> bool:
+    if any(os.path.isfile(candidate) for candidate in _expand_lib_path(path)):
+        return True
+    if "${LIB}" in path or "$LIB" in path:
+        # Some distributions use a multiarch directory such as
+        # /usr/lib/x86_64-linux-gnu instead of lib64/lib.
+        pattern = path.replace("${LIB}", "*").replace("$LIB", "*")
+        return any(os.path.isfile(candidate) for candidate in glob.glob(pattern))
+    return False
+
+
+def _steam_env(cfg: dict) -> dict[str, str]:
+    """Return the environment to launch Steam with.
+
+    extest is optional: if it is not installed, or the user disabled it, Steam
+    keeps the normal XTEST/Xwayland behaviour.  An existing LD_PRELOAD (from a
+    wrapper or another tool) is preserved.
+    """
+    env = os.environ.copy()
+    if not cfg.get("preload_extest", True):
+        return env
+
+    library = os.path.expanduser(str(cfg.get("extest_library") or EXTEST_LIBRARY))
+    if not _extest_available(library):
+        LOG.debug("extest not found at %s; leaving LD_PRELOAD unchanged", library)
+        return env
+
+    preload = [part for part in env.get("LD_PRELOAD", "").split(":") if part]
+    if library not in preload:
+        preload.insert(0, library)
+    if preload:
+        env["LD_PRELOAD"] = ":".join(preload)
+    return env
+
+
+def _spawn(cmd: list[str], env: dict[str, str] | None = None) -> None:
     try:
         subprocess.Popen(
             cmd,
@@ -239,7 +296,7 @@ def _spawn(cmd: list[str]) -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             cwd=os.path.expanduser("~"),
-            env=os.environ.copy(),
+            env=env if env is not None else os.environ.copy(),
         )
     except OSError as exc:
         LOG.error("could not run %s: %s", " ".join(cmd), exc)
@@ -482,14 +539,14 @@ class Actions:
         LOG.info("launching Steam Big Picture")
         if self.dry_run:
             return
-        _spawn([self.cfg["steam_binary"], "-bigpicture"])
+        _spawn([self.cfg["steam_binary"], "-bigpicture"], env=_steam_env(self.cfg))
         self.focus_big_picture(wait=wait_focus)
 
     def open_steam_bp(self, wait_focus: bool = False) -> None:
         LOG.info("switching Steam to Big Picture")
         if self.dry_run:
             return
-        _spawn([self.cfg["steam_binary"], "steam://open/bigpicture"])
+        _spawn([self.cfg["steam_binary"], "steam://open/bigpicture"], env=_steam_env(self.cfg))
         self.focus_big_picture(wait=wait_focus)
 
     # --- restart --------------------------------------------------------
@@ -535,6 +592,7 @@ class Actions:
                 [self.cfg["steam_binary"], "-shutdown"],
                 timeout=15,
                 capture_output=True,
+                env=_steam_env(self.cfg),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             LOG.debug("steam -shutdown: %s", exc)
@@ -570,7 +628,7 @@ class Actions:
             self.launch_steam_bp(wait_focus=wait_focus)
         elif relaunch == "auto":
             LOG.info("relaunching Steam in desktop mode")
-            _spawn([self.cfg["steam_binary"], "-silent"])
+            _spawn([self.cfg["steam_binary"], "-silent"], env=_steam_env(self.cfg))
 
     def force_restart_steam(self) -> None:
         self.restart_steam("controller hold (View + Menu)", relaunch="bp")
@@ -1076,6 +1134,23 @@ def doctor(cfg: dict, vendor: int, allowed_ids: list[str]) -> int:
     steam = str(cfg["steam_binary"])
     report("Steam binary", os.path.isfile(steam) and os.access(steam, os.X_OK), steam)
 
+    extest_library = os.path.expanduser(
+        str(cfg.get("extest_library") or EXTEST_LIBRARY)
+    )
+    if not cfg.get("preload_extest", True):
+        report("extest Steam input", True, "disabled in config", fatal=False)
+    elif _extest_available(extest_library):
+        report("extest Steam input", True, extest_library, fatal=False)
+    elif "WAYLAND" in session.upper():
+        report(
+            "extest Steam input",
+            False,
+            f"not found at {extest_library}; Steam may prompt for Remote Desktop",
+            fatal=False,
+        )
+    else:
+        report("extest Steam input", True, "optional on X11; not installed", fatal=False)
+
     try:
         load_config()
         report("config parses", True, CONFIG_PATH)
@@ -1142,6 +1217,44 @@ def self_test() -> int:
     check("extra A before combo allows match", results[-1] is True, True)
     results = run(steps, ["B"] + seq)
     check("unrelated leading button still allows match", results[-1] is True, True)
+
+    # Steam environment / extest preload.
+    saved_preload = os.environ.pop("LD_PRELOAD", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "libextest.so")
+            with open(fake, "w", encoding="utf-8") as fh:
+                fh.write("")
+            cfg = dict(DEFAULT_CONFIG)
+            cfg["extest_library"] = fake
+            check("extest is preloaded for Steam", _steam_env(cfg).get("LD_PRELOAD"), fake)
+            os.environ["LD_PRELOAD"] = "/existing.so"
+            check(
+                "existing LD_PRELOAD is preserved",
+                _steam_env(cfg).get("LD_PRELOAD"),
+                f"{fake}:/existing.so",
+            )
+            os.environ["LD_PRELOAD"] = fake
+            check("extest is not duplicated", _steam_env(cfg).get("LD_PRELOAD"), fake)
+            cfg["preload_extest"] = False
+            check("extest can be disabled", _steam_env(cfg).get("LD_PRELOAD"), fake)
+            cfg["preload_extest"] = True
+            cfg["extest_library"] = os.path.join(tmp, "missing.so")
+            check(
+                "missing extest leaves LD_PRELOAD alone",
+                _steam_env(cfg).get("LD_PRELOAD"),
+                fake,
+            )
+        check(
+            "${LIB} expands for both ABIs",
+            _expand_lib_path("/usr/${LIB}/extest/libextest.so"),
+            ["/usr/lib64/extest/libextest.so", "/usr/lib/extest/libextest.so"],
+        )
+    finally:
+        if saved_preload is None:
+            os.environ.pop("LD_PRELOAD", None)
+        else:
+            os.environ["LD_PRELOAD"] = saved_preload
 
     # State planner.
     cases = {

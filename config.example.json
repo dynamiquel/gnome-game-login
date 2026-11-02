@@ -13,6 +13,8 @@
   "min_action_interval_ms": 3000,
   "vendor_id": "045e",
   "steam_binary": "/usr/bin/steam",
+  "preload_extest": true,
+  "extest_library": "/usr/${LIB}/extest/libextest.so",
   "force_restart_hold_ms": 5000,
   "hang_watchdog": true,
   "hang_cpu_percent": 85,
